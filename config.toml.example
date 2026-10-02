@@ -1,0 +1,12 @@
+[plugin]
+enabled = true
+config_version = "0.1.0"
+
+[install]
+plugins_root = ""
+auto_reload = true
+api_endpoint = "submit"
+
+[permission]
+enabled = true
+allowed_users = ""
