@@ -3,10 +3,11 @@ enabled = true
 config_version = "0.1.0"
 
 [install]
+# plugins 根目录；留空自动推断为宿主 plugins 目录。
+# 填写时必须是「真实存在、且位于宿主 plugins 目录下」的路径，否则自动回退默认。
 plugins_root = ""
-auto_reload = true
-api_endpoint = "submit"
 
 [permission]
 enabled = true
+# 有权审批安装的管理员 ID，逗号分隔；留空且启用则拒绝所有人（fail-closed）
 allowed_users = ""

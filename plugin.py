@@ -41,9 +41,7 @@ class InstallConfig(PluginConfigBase):
     __ui_icon__ = "download"
     __ui_order__ = 1
 
-    plugins_root: str = Field(default="", description="plugins 根目录；留空自动推断")
-    auto_reload: bool = Field(default=True, description="安装后自动重载该插件")
-    api_endpoint: str = Field(default="submit", description="对外暴露的提交接口名")
+    plugins_root: str = Field(default="", description="plugins 根目录；留空自动推断。必须位于宿主 plugins 目录下，否则回退默认")
 
 
 class PermissionConfig(PluginConfigBase):
@@ -66,14 +64,15 @@ class PluginInstaller(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._pending: dict[str, dict[str, Any]] = {}
+        self._load_pending()
         try:
             await self._register_api()
         except Exception:  # noqa: BLE001
             self.ctx.logger.warning("注册提交接口失败", exc_info=True)
         self.ctx.logger.info(
-            "插件安装审批器已加载 (plugins_root=%s, endpoint=%s)",
+            "插件安装审批器已加载 (plugins_root=%s, pending=%d)",
             self._plugins_root(),
-            self.config.install.api_endpoint,
+            len(self._pending),
         )
 
     async def on_unload(self) -> None:
@@ -85,10 +84,63 @@ class PluginInstaller(MaiBotPlugin):
     # ── 内部辅助 ──────────────────────────────────────────────
 
     def _plugins_root(self) -> Path:
+        """返回安装根目录；配置值必须是位于宿主 plugins 下的真实目录，否则回退默认。"""
         root = self.config.install.plugins_root.strip()
         if root:
-            return Path(root)
+            try:
+                cand = Path(root).resolve()
+                cand.relative_to(PLUGINS_ROOT.resolve())  # 必须落在宿主 plugins 内
+                if cand.is_dir():
+                    return cand
+                self.ctx.logger.warning("plugins_root 不存在，回退默认：%s", root)
+            except Exception:  # noqa: BLE001
+                self.ctx.logger.warning("plugins_root 非法（须位于宿主 plugins 目录内），回退默认：%s", root)
         return PLUGINS_ROOT
+
+    def _pending_file(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / "pending.json"
+
+    def _load_pending(self) -> None:
+        try:
+            fp = self._pending_file()
+            if fp.is_file():
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._pending = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:  # noqa: BLE001
+            self.ctx.logger.warning("读取待审列表失败", exc_info=True)
+
+    def _save_pending(self) -> None:
+        try:
+            fp = self._pending_file()
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(json.dumps(self._pending, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            self.ctx.logger.warning("保存待审列表失败", exc_info=True)
+
+    @staticmethod
+    def _dir_fingerprint(path: Path) -> tuple[int, int, str]:
+        """目录指纹：(文件数, 总字节, 内容哈希前 16 位)。"""
+        import hashlib
+
+        n = 0
+        total = 0
+        h = hashlib.sha256()
+        try:
+            for fp in sorted(path.rglob("*")):
+                if not fp.is_file():
+                    continue
+                n += 1
+                try:
+                    data = fp.read_bytes()
+                except Exception:  # noqa: BLE001
+                    continue
+                total += len(data)
+                h.update(str(fp.relative_to(path)).encode("utf-8", "replace"))
+                h.update(hashlib.sha256(data).digest())
+        except Exception:  # noqa: BLE001
+            pass
+        return n, total, h.hexdigest()[:16]
 
     async def _register_api(self) -> None:
         ok = await self.sync_dynamic_apis()
@@ -153,18 +205,31 @@ class PluginInstaller(MaiBotPlugin):
         if not pid:
             return {"success": False, "error": "manifest 缺少 id"}
 
-        self._pending[pid] = {"dir": str(p), "stream_id": stream_id, "name": name}
-        self.ctx.logger.info("收到待审插件：%s (%s) from %s", pid, name, p)
+        files, total, digest = self._dir_fingerprint(p)
+        replaced = pid in self._pending
+        self._pending[pid] = {
+            "dir": str(p.resolve()),
+            "stream_id": stream_id,
+            "name": name,
+            "files": files,
+            "bytes": total,
+            "digest": digest,
+        }
+        self._save_pending()
+        self.ctx.logger.info("收到待审插件：%s (%s) from %s files=%d digest=%s", pid, name, p, files, digest)
         if stream_id:
+            head = "📦 发现待安装插件" + ("（已替换同 id 的旧待审）" if replaced else "")
             try:
                 await self.ctx.send.text(
-                    f"📦 发现待安装插件：{name}（{pid}）\n"
+                    f"{head}：{name}（{pid}）\n"
+                    f"源目录：{p.resolve()}\n"
+                    f"文件：{files} 个 / 共 {total} 字节 / 指纹 {digest}\n"
                     f"管理员回复 /pi_approve {pid} 安装，/pi_deny {pid} 忽略。",
                     stream_id,
                 )
             except Exception:  # noqa: BLE001
                 self.ctx.logger.warning("审批请求发送失败", exc_info=True)
-        return {"success": True, "plugin_id": pid, "name": name, "pending": True}
+        return {"success": True, "plugin_id": pid, "name": name, "files": files, "digest": digest, "pending": True}
 
     # ── 安装 ──────────────────────────────────────────────────
 
@@ -172,6 +237,11 @@ class PluginInstaller(MaiBotPlugin):
         src = Path(info["dir"])
         if not src.is_dir():
             return False, f"源目录不存在：{src}"
+        # 安装前复核：源目录自提交后不得被改动（指纹一致）
+        if "digest" in info:
+            cur = self._dir_fingerprint(src)
+            if cur != (int(info.get("files", -1)), int(info.get("bytes", -1)), str(info.get("digest") or "")):
+                return False, "安全拒绝：源目录自提交后已被改动（指纹不符），已中止安装"
         dst = (self._plugins_root() / pid).resolve()
         try:
             dst.relative_to(self._plugins_root().resolve())
@@ -196,7 +266,7 @@ class PluginInstaller(MaiBotPlugin):
                 self.ctx.logger.warning("启用 config 改写失败", exc_info=True)
 
         self._pending.pop(pid, None)
-        # 注意：把插件写进 plugins/ 本身就会触发宿主扫描并加载新插件；
+        self._save_pending()
         # 此处不再显式 reload_plugin，避免与宿主重载撞车（后者会中断本命令）。
         return True, f"✅ 已安装并启用插件 {pid}（{info.get('name', pid)}），宿主将自动加载"
 
@@ -228,6 +298,7 @@ class PluginInstaller(MaiBotPlugin):
         pid = self._arg(kwargs, "plugin_id", r"^/pi_deny\s+([^\s]+)$")
         removed = self._pending.pop(pid, None)
         if removed:
+            self._save_pending()
             await self.ctx.send.text(f"已忽略待审插件 {pid}（源目录保留）", stream_id)
             return True, "已忽略", False
         await self.ctx.send.text(f"没有待审插件：{pid}", stream_id)
